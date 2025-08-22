@@ -191,7 +191,7 @@ function Player:takeHit(atk, dir)
   self.invuln = 0.05
   -- Spawn blood at center of hurtbox
   local hb = self:getHurtbox()
-  blood:spawn(hb.x + hb.w/2, hb.y + hb.h/2, dir, atk.damage)
+  blood:spawn(hb.x + hb.w / 2, hb.y + hb.h / 2, dir, atk.damage)
 end
 
 function Player:updateAttack(dt, opponent)
@@ -233,9 +233,9 @@ end
 
 function Player:getHitbox()
   local base = self:getHurtbox()
-  local rangeX = 30
-  local hbWidth = 34
-  local hbHeight = 48
+  local rangeX = 30 * 1.5 -- increased forward reach
+  local hbWidth = 34 * 1.5
+  local hbHeight = 48 * 1.5
   local x = base.x + (self.facing == 1 and (self.w + rangeX) or -(rangeX + hbWidth))
   local y = base.y + 20
   return { x = x, y = y, w = hbWidth, h = hbHeight }
