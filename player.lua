@@ -3,12 +3,37 @@
 
 local Player = {}
 Player.__index = Player
-local blood = require('effects.blood')
+local money = require('effects.money')
 
 local ATTACKS = {
   light = { name = "light", startup = 0.08, active = 0.10, recovery = 0.20, damage = 6, knockback = 1180, stamina = 0 },
   heavy = { name = "heavy", startup = 0.18, active = 0.14, recovery = 0.35, damage = 14, knockback = 1320, stamina = 0 },
   special = { name = "special", startup = 0.25, active = 0.25, recovery = 0.45, damage = 22, knockback = 1450, stamina = 35 },
+  hairball = { name = "hairball", startup = 0.12, active = 0.05, recovery = 0.30, damage = 8, knockback = 800, stamina = 15 },
+}
+
+-- Taunt messages for players
+local TAUNT_MESSAGES = {
+  "Hiss! 🐱",
+  "You're going down!",
+  "Meow meow!",
+  "Bring it on!",
+  "You can't handle this!",
+  "Purr-fect timing!",
+  "Claws out!",
+  "I'm the alpha cat!",
+  "Time to scratch!",
+  "You're just a kitten!",
+  "Rawr! 🦁",
+  "I'll make you purr!",
+  "Cat got your tongue?",
+  "Nine lives, zero chance!",
+  "I'm feline dangerous!",
+  "Let's claw this out!",
+  "You're not cat enough!",
+  "Time to pounce!",
+  "I'm the cat's meow!",
+  "Prepare for the claw!"
 }
 
 -- Utility AABB collision
@@ -75,7 +100,7 @@ function Player.new(opts)
   self.hitstun = 0
   self.dashTime = 0
   self.dashDuration = 0.18
-  self.dashSpeed = 520
+  self.dashSpeed = 1180
   self.dashCost = 30
   self.dashIFrames = 0.12
   self.velx = 0
@@ -96,6 +121,20 @@ function Player.new(opts)
   self.anim = 'idle'
   self.animTimer = 0
   self.animFrameIndex = 1
+  -- Flash state for down key
+  self.flashTime = 0
+  self.flashDuration = 0.5
+  self.hairballCallback = nil -- callback for spawning hairballs
+  -- Taunt system
+  self.tauntTimer = 0
+  self.tauntCooldown = 0
+  self.currentTaunt = nil
+  self.tauntDisplayTime = 0
+  self.tauntDuration = 2.0
+  self.tauntCooldownDuration = 3.0
+  self.minTauntInterval = 3.0
+  self.maxTauntInterval = 8.0
+  self.nextTauntTime = love.math.random(self.minTauntInterval, self.maxTauntInterval)
   return self
 end
 
@@ -118,10 +157,66 @@ function Player:resetForRound(spawnX)
   self.velx = 0
   self.vely = 0
   self.alive = true
+  self.flashTime = 0
+  -- Reset taunt system
+  self.tauntTimer = 0
+  self.tauntCooldown = 0
+  self.currentTaunt = nil
+  self.tauntDisplayTime = 0
+  self.nextTauntTime = love.math.random(self.minTauntInterval, self.maxTauntInterval)
 end
 
 function Player:isBusy()
   return self.state == 'attacking' or self.state == 'dashing' or self.hitstun > 0
+end
+
+function Player:canTaunt()
+  return self.alive and not self:isBusy() and self.tauntCooldown <= 0 and self.currentTaunt == nil
+end
+
+function Player:startTaunt()
+  if not self:canTaunt() then return end
+  
+  -- Pick a random taunt message
+  local tauntIndex = love.math.random(1, #TAUNT_MESSAGES)
+  self.currentTaunt = TAUNT_MESSAGES[tauntIndex]
+  self.tauntDisplayTime = 0
+  
+  
+  -- Set cooldown
+  self.tauntCooldown = self.tauntCooldownDuration
+  
+  -- Schedule next taunt
+  self.nextTauntTime = love.math.random(self.minTauntInterval, self.maxTauntInterval)
+end
+
+function Player:updateTaunt(dt)
+  -- Update taunt cooldown
+  if self.tauntCooldown > 0 then
+    self.tauntCooldown = math.max(0, self.tauntCooldown - dt)
+  end
+  
+  -- Update current taunt display
+  if self.currentTaunt then
+    self.tauntDisplayTime = self.tauntDisplayTime + dt
+    if self.tauntDisplayTime >= self.tauntDuration then
+      self.currentTaunt = nil
+      self.tauntDisplayTime = 0
+    end
+  end
+  
+  -- Check if it's time to taunt
+  if self:canTaunt() then
+    self.tauntTimer = self.tauntTimer + dt
+    if self.tauntTimer >= self.nextTauntTime then
+      self:startTaunt()
+      self.tauntTimer = 0
+    end
+  else
+    -- Reset timer if we can't taunt
+    self.tauntTimer = 0
+  end
+  
 end
 
 function Player:pressDirection(dir, time)
@@ -152,7 +247,7 @@ function Player:jump()
   self.vely = self.jumpVel
 end
 
-function Player:attemptAttack(kind, simultaneousPressed)
+function Player:attemptAttack(kind, simultaneousPressed, allowOnDead)
   if self.state == 'dashing' or self.hitstun > 0 then return end
   if self.state == 'attacking' then return end
   local atk
@@ -160,6 +255,11 @@ function Player:attemptAttack(kind, simultaneousPressed)
     atk = ATTACKS.light
   elseif kind == 'heavy' then
     atk = ATTACKS.heavy
+  elseif kind == 'hairball' then
+    atk = ATTACKS.hairball
+    -- Check stamina for hairball attack
+    if self.stamina < atk.stamina then return end
+    self.stamina = self.stamina - atk.stamina
   end
   -- Special: both attack buttons considered simultaneously
   if simultaneousPressed and self.stamina >= ATTACKS.special.stamina then
@@ -167,10 +267,17 @@ function Player:attemptAttack(kind, simultaneousPressed)
     self.stamina = self.stamina - atk.stamina
   end
   if not atk then return end
+  
+  -- Play attack sound when attack is initiated
+  if self.attackSoundCallback then
+    self.attackSoundCallback()
+  end
+  
   self.state = 'attacking'
   self.attackData = atk
   self.attackPhase = 'startup'
   self.stateTimer = 0
+  self.allowAttackOnDead = allowOnDead or false
 end
 
 function Player:takeHit(atk, dir)
@@ -189,9 +296,20 @@ function Player:takeHit(atk, dir)
     self.vely = self.vely - 120
   end
   self.invuln = 0.05
-  -- Spawn blood at center of hurtbox
+  -- Spawn money at center of hurtbox
   local hb = self:getHurtbox()
-  blood:spawn(hb.x + hb.w / 2, hb.y + hb.h / 2, dir, atk.damage)
+  money:spawn(hb.x + hb.w / 2, hb.y + hb.h / 2, dir, atk.damage)
+  -- Play hit sound
+  if self.hitSoundCallback then
+    self.hitSoundCallback()
+  end
+end
+
+function Player:performFinishingMove(deadOpponent, atk)
+  -- Signal to versus state that finishing move was performed
+  if self.finishMoveCallback then
+    self.finishMoveCallback(deadOpponent, atk)
+  end
 end
 
 function Player:updateAttack(dt, opponent)
@@ -208,9 +326,25 @@ function Player:updateAttack(dt, opponent)
     end
   elseif self.attackPhase == 'active' then
     phaseDur = atk.active
-    local hb = self:getHitbox()
-    if opponent.alive and opponent.hitstun <= 0 and aabb(hb, opponent:getHurtbox()) then
-      opponent:takeHit(atk, self.facing)
+    if atk.name == 'hairball' then
+      -- Spawn hairball projectile
+      if self.hairballCallback then
+        local spawnX = self.x + (self.facing * 30) -- spawn in front of player
+        local spawnY = self.y - 20 -- slightly above player center
+        self.hairballCallback(spawnX, spawnY, self.facing, self.id)
+      end
+    else
+      -- Regular melee attack
+      local hb = self:getHitbox()
+      local canHit = (opponent.alive and opponent.hitstun <= 0) or (self.allowAttackOnDead and not opponent.alive)
+      if canHit and aabb(hb, opponent:getHurtbox()) then
+        if opponent.alive then
+          opponent:takeHit(atk, self.facing)
+        else
+          -- Finishing move on dead opponent
+          self:performFinishingMove(opponent, atk)
+        end
+      end
     end
     if phaseTime >= phaseDur then
       self.attackPhase = 'recovery'
@@ -241,7 +375,7 @@ function Player:getHitbox()
   return { x = x, y = y, w = hbWidth, h = hbHeight }
 end
 
-function Player:update(dt, opponent, input, now)
+function Player:update(dt, opponent, input, now, allowFinishingMove)
   -- Regenerate stamina
   if self.stamina < self.maxStamina and self.state ~= 'attacking' then
     self.stamina = math.min(self.maxStamina, self.stamina + self.staminaRegen * dt)
@@ -250,6 +384,15 @@ function Player:update(dt, opponent, input, now)
   if self.invuln > 0 then self.invuln = math.max(0, self.invuln - dt) end
   if self.hitstun > 0 then
     self.hitstun = math.max(0, self.hitstun - dt)
+  end
+  
+  -- Update flash timer
+  if self.flashTime > 0 then
+    self.flashTime = math.max(0, self.flashTime - dt)
+    -- Keep invincibility during flash
+    if self.flashTime > 0 then
+      self.invuln = math.max(self.invuln, 0.01)
+    end
   end
 
   if opponent then
@@ -278,13 +421,30 @@ function Player:update(dt, opponent, input, now)
     if input:pressed(self.controls.up) then
       self:jump()
     end
+    
+    -- Flash/Invincibility (down key)
+    if input:pressed(self.controls.down) and self.flashTime <= 0 then
+      self.flashTime = self.flashDuration
+    end
 
     local lightPressed = input:pressed(self.controls.light)
     local heavyPressed = input:pressed(self.controls.heavy)
+    local hairballPressed = input:pressed(self.controls.hairball)
     if lightPressed or heavyPressed then
       local simultaneous = lightPressed and heavyPressed
-      self:attemptAttack(lightPressed and 'light' or 'heavy', simultaneous)
+      self:attemptAttack(lightPressed and 'light' or 'heavy', simultaneous, allowFinishingMove)
+    elseif hairballPressed then
+      self:attemptAttack('hairball', false, allowFinishingMove)
     end
+  elseif not self.alive then
+    -- Dead players stand in place - stop all movement
+    self.velx = 0
+    self.vely = 0
+    self.state = 'idle'
+    self.attackData = nil
+    self.attackPhase = nil
+    self.hitstun = 0
+    self.invuln = 0
   end
 
   if self.state == 'dashing' then
@@ -296,6 +456,9 @@ function Player:update(dt, opponent, input, now)
   end
 
   self:updateAttack(dt, opponent)
+  
+  -- Update taunt system
+  self:updateTaunt(dt)
 
   -- Apply knockback decay while in hitstun
   if self.hitstun > 0 then
@@ -307,31 +470,47 @@ function Player:update(dt, opponent, input, now)
     self.hitVelx = 0
   end
 
-  -- Apply gravity & vertical motion
-  self.vely = self.vely + self.gravity * dt
-  self.y = self.y + self.vely * dt
-  if self.y > self.groundY then
-    self.y = self.groundY
-    self.vely = 0
-  end
-
-  -- Friction: do not apply while in hitstun (maintain knockback), but resume after
-  if self:onGround() and self.state ~= 'dashing' and self.state ~= 'attacking' then
-    if self.hitstun <= 0 then
-      self.velx = self.velx * 0.80
+  -- Skip position updates during finishing move (handled by versus state)
+  if not self.finishingMove then
+    -- Apply gravity & vertical motion
+    self.vely = self.vely + self.gravity * dt
+    self.y = self.y + self.vely * dt
+    if self.y > self.groundY then
+      self.y = self.groundY
+      self.vely = 0
     end
+
+    -- Friction: do not apply while in hitstun (maintain knockback), but resume after
+    if self:onGround() and self.state ~= 'dashing' and self.state ~= 'attacking' then
+      if self.hitstun <= 0 then
+        self.velx = self.velx * 0.80
+      end
+    end
+
+    self.x = self.x + self.velx * dt
+
+    local minX, maxX = 80, 1280 - 80
+    if self.x < minX then self.x = minX end
+    if self.x > maxX then self.x = maxX end
   end
-
-  self.x = self.x + self.velx * dt
-
-  local minX, maxX = 80, 1280 - 80
-  if self.x < minX then self.x = minX end
-  if self.x > maxX then self.x = maxX end
 end
 
 function Player:draw()
   -- Update / select animation just before draw (after physics)
   self:updateAnimation(love.timer.getDelta())
+  
+  -- Calculate alpha for flashing effect
+  local alpha = 1
+  if self.invuln > 0 then
+    if self.flashTime > 0 then
+      -- Fast flashing during down key invincibility
+      alpha = (math.sin(self.flashTime * 20) > 0) and 1 or 0.3
+    else
+      -- Normal invincibility flash (slower)
+      alpha = 0.6
+    end
+  end
+  
   if Player.sheet then
     local anim = ANIMS[self.anim]
     local frameId = anim.frames[self.animFrameIndex]
@@ -339,13 +518,11 @@ function Player:draw()
     local sx = self.facing == -1 and -1 or 1
     local ox = Player.frameW / 2
     local oy = Player.frameH
-    local alpha = self.invuln > 0 and 0.6 or 1
     love.graphics.setColor(1, 1, 1, alpha)
     love.graphics.draw(Player.sheet, quad, self.x, self.y, 0, sx, 1, ox, oy)
   else
     -- Fallback rectangle placeholder if sheet missing
     local hb = self:getHurtbox()
-    local alpha = self.invuln > 0 and 0.4 or 1
     love.graphics.setColor(self.color[1], self.color[2], self.color[3], alpha)
     love.graphics.rectangle('fill', hb.x, hb.y, hb.w, hb.h, 6, 6)
   end
@@ -359,6 +536,12 @@ function Player:draw()
     love.graphics.setColor(1, 0.2, 0.2, 0.25)
     love.graphics.rectangle('line', hb2.x, hb2.y, hb2.w, hb2.h)
   end
+  
+  -- Draw taunt text box
+  if self.currentTaunt then
+    self:drawTaunt()
+  end
+  
   love.graphics.setColor(1, 1, 1, 1)
 end
 
@@ -400,6 +583,67 @@ function Player:updateAnimation(dt)
       end
     end
   end
+end
+
+function Player:drawTaunt()
+  if not self.currentTaunt then return end
+  
+  -- Set up font for taunt text
+  local font = love.graphics.newFont(16)
+  love.graphics.setFont(font)
+  
+  -- Calculate text dimensions
+  local textWidth = font:getWidth(self.currentTaunt)
+  local textHeight = font:getHeight()
+  
+  -- Calculate bubble dimensions with padding
+  local padding = 12
+  local bubbleWidth = textWidth + padding * 2
+  local bubbleHeight = textHeight + padding * 2
+  
+  -- Position bubble above player (ensure it's well above the player)
+  local bubbleX = self.x - bubbleWidth / 2
+  local bubbleY = self.y - self.h - bubbleHeight -240  -- Increased distance from player
+  
+  
+  -- Calculate alpha based on remaining display time (fade out in last 0.5 seconds)
+  local alpha = 1
+  if self.tauntDisplayTime > self.tauntDuration - 0.5 then
+    local fadeTime = self.tauntDisplayTime - (self.tauntDuration - 0.5)
+    alpha = 1 - (fadeTime / 0.5)
+  end
+  
+  -- Draw speech bubble background
+  love.graphics.setColor(1, 1, 1, alpha * 0.95)
+  love.graphics.rectangle('fill', bubbleX, bubbleY, bubbleWidth, bubbleHeight, 8, 8)
+  
+  -- Draw speech bubble border
+  love.graphics.setColor(0.2, 0.2, 0.2, alpha)
+  love.graphics.rectangle('line', bubbleX, bubbleY, bubbleWidth, bubbleHeight, 8, 8)
+  
+  -- Draw speech bubble tail (pointing down to player)
+  local tailX = self.x
+  local tailY = bubbleY + bubbleHeight
+  local tailSize = 8
+  love.graphics.setColor(1, 1, 1, alpha * 0.95)
+  love.graphics.polygon('fill', 
+    tailX, tailY,
+    tailX - tailSize, tailY + tailSize,
+    tailX + tailSize, tailY + tailSize
+  )
+  love.graphics.setColor(0.2, 0.2, 0.2, alpha)
+  love.graphics.polygon('line', 
+    tailX, tailY,
+    tailX - tailSize, tailY + tailSize,
+    tailX + tailSize, tailY + tailSize
+  )
+  
+  -- Draw taunt text
+  love.graphics.setColor(0.1, 0.1, 0.1, alpha)
+  love.graphics.printf(self.currentTaunt, bubbleX + padding, bubbleY + padding, textWidth, 'center')
+  
+  -- Reset font
+  love.graphics.setFont(love.graphics.newFont(12))
 end
 
 return Player
